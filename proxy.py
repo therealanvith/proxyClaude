@@ -878,6 +878,7 @@ class Handler(BaseHTTPRequestHandler):
             if st == 429 and is_smart(model_used):
                 resp.read()
                 conn.close()
+                ROUTE.smart_result(False)
                 log("smart model %s hit 429 -> rotating key, retrying smart" % (model_used,))
                 # Force key rotation (mimic fail behavior for rotation without counting fails)
                 with STATE.lock:
@@ -885,7 +886,11 @@ class Handler(BaseHTTPRequestHandler):
                         old = STATE.keys.pop(0)
                         STATE.keys.append(old)
                         STATE.fails = 0
-                model_used = SMART_MODEL  # retry same smart model with new key
+                if ROUTE.escalate():
+                    model_used = WORKER_MODEL
+                    log('smart model rate-limited -> falling back to worker')
+                else:
+                    model_used = SMART_MODEL  # retry same smart model with new key
                 continue
 
             if st in KEY_STATUSES:
