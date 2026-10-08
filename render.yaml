@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: keyproxy
+    env: python
+    buildCommand: ""
+    startCommand: "python proxy.py"
+    envVars:
+      - key: PORT
+        value: 4000
+      - key: HOST
+        value: 0.0.0.0
+      - key: SMART_MODEL
+        sync: false
+      - key: WORKER_MODEL
+        sync: false
+      - key: HELPER_MODEL
+        sync: false
+      - fromGroup: proxy_keys
+
+envVarGroups:
+  - name: proxy_keys
+    envVars:
+      - key: API_KEY_1
+        sync: false
+      - key: PROXY_USER_anvith
+        sync: false

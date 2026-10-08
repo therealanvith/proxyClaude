@@ -1,0 +1,14 @@
+# Secrets / local config
+.env
+*.log
+__pycache__/
+
+# Backups / generated
+key_proxy.log
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/

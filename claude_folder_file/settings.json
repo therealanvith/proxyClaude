@@ -1,0 +1,20 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:5000",
+    "ANTHROPIC_AUTH_TOKEN": "your-token-from-website",
+    "ANTHROPIC_API_KEY": "",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "qwen/qwen3.8-27b:free"
+  },
+  "permissions": {
+    "allow": [],
+    "deny": []
+  },
+  "model": "qwen/qwen3.8-27b:free",
+  "modelSettings": {
+    "qwen/qwen3.8-27b:free": {
+      "effortLevel": "high"
+    }
+  },
+  "theme": "dark-ansi"
+}
