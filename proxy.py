@@ -454,6 +454,7 @@ class RouteState:
     def __init__(self):
         self.lock = threading.Lock()
         self.worker_fails = 0
+        self.smart_fails = 0
         self.smart_until = 0.0
 
     def smart_available(self):
@@ -468,10 +469,14 @@ class RouteState:
         with self.lock:
             self.worker_fails = 0 if ok else self.worker_fails + 1
 
+    def smart_result(self, ok):
+        with self.lock:
+            self.smart_fails = 0 if ok else self.smart_fails + 1
+
     def escalate(self):
         with self.lock:
-            if self.worker_fails >= WORKER_FAIL_LIMIT and time.time() >= self.smart_until:
-                self.worker_fails = 0
+            if self.smart_fails >= 2 and time.time() >= self.smart_until:
+                self.smart_fails = 0
                 return True
             return False
 
@@ -487,7 +492,7 @@ def pick_model(obj):
     if not has_tools:
         return HELPER_MODEL, "helper (no tools)"
     if ROUTE.escalate():
-        return SMART_MODEL, "worker failed %dx -> escalate to smart" % WORKER_FAIL_LIMIT
+        return WORKER_MODEL, "smart failed %dx -> switch to worker" % WORKER_FAIL_LIMIT
     if not msgs:
         return WORKER_MODEL, "no messages"
     if _msg_has_image(msgs):
@@ -863,6 +868,8 @@ class Handler(BaseHTTPRequestHandler):
                     conn.close()
                 if is_worker(model_used):
                     ROUTE.worker_result(False)
+                if is_smart(model_used):
+                    ROUTE.smart_result(False)
                 return self.send_json(502, "Upstream connection error: %r" % (e,))
 
             st = resp.status
@@ -902,6 +909,8 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.ok(key)
             if is_worker(model_used):
                 ROUTE.worker_result(st < 400)
+            if is_smart(model_used):
+                ROUTE.smart_result(st < 400)
             log("%s %s -> %d (key %s)" % (self.command, self.path, st, mask(key)))
             try:
                 self.send_response(st)
