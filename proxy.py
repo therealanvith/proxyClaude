@@ -888,9 +888,11 @@ class Handler(BaseHTTPRequestHandler):
                         STATE.fails = 0
                 if ROUTE.escalate():
                     model_used = WORKER_MODEL
+                    body = set_body_model(body, WORKER_MODEL)
                     log('smart model rate-limited -> falling back to worker')
                 else:
                     model_used = SMART_MODEL  # retry same smart model with new key
+                    body = set_body_model(body, SMART_MODEL)
                 continue
 
             if st in KEY_STATUSES:
