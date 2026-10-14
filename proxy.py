@@ -60,7 +60,7 @@ SMART_MODEL = os.environ.get("SMART_MODEL", "apodex/apodex-1.1-mini:free")
 WORKER_MODEL = os.environ.get("WORKER_MODEL", "thinkingmachines/inkling:free")
 HELPER_MODEL = os.environ.get("HELPER_MODEL", WORKER_MODEL)
 HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "4000"))
+PORT = int(os.environ.get("PORT", "5000"))
 DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 

@@ -1,7 +1,7 @@
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:5000",
-    "ANTHROPIC_AUTH_TOKEN": "your-token-from-website",
+    "ANTHROPIC_AUTH_TOKEN": "9QtfH_tZPYyQdrUGTJ2saUM1nERQ0OSY4XYcz-RqXd8",
     "ANTHROPIC_API_KEY": "",
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "qwen/qwen3.8-27b:free"
