@@ -1,4 +1,4 @@
-"""KeyProxy v10-deploy: secure multi-key OpenRouter proxy."""
+"""KeyProxy v10.1-deploy: secure multi-key OpenRouter proxy."""
 import os, re, time, json, hmac, html, base64, secrets, logging, threading, http.client
 from logging.handlers import RotatingFileHandler
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -78,12 +78,15 @@ DECISION_COOLDOWN = int(os.environ.get("DECISION_COOLDOWN", "60"))
 # print tool calls as plain text when reasoning mode is on).
 STRIP_THINKING = os.environ.get("STRIP_THINKING", "1") != "0"
 
+# Chars of the last message's text shown in request logs (0 = never log message text).
+LOG_PREVIEW = int(os.environ.get("LOG_PREVIEW", "80"))
+
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "5000"))
 DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-VERSION = "v10-deploy"
+VERSION = "v10.1-deploy"
 UPSTREAM_HOST = "openrouter.ai"
 UPSTREAM_PREFIX = "/api"
 
@@ -137,6 +140,25 @@ def log(msg):
 
 def mask(key):
     return ("..." + key[-4:]) if key else "..."
+
+
+_req_counter = 0
+_req_lock = threading.Lock()
+
+
+def next_rid():
+    global _req_counter
+    with _req_lock:
+        _req_counter += 1
+        return _req_counter
+
+
+def preview(text, n=None):
+    n = LOG_PREVIEW if n is None else n
+    if n <= 0:
+        return ""
+    t = " ".join(str(text).replace('"', "'").split())
+    return t[:n] + ("..." if len(t) > n else "")
 
 
 # ----------------------------------------------------------------- user store
@@ -507,6 +529,7 @@ class RouteState:
     def limit_smart(self):
         with self.lock:
             self.smart_until = time.time() + SMART_COOLDOWN
+        log("COOLDOWN smart model paused for %ds" % SMART_COOLDOWN)
 
     def decision_available(self):
         with self.lock:
@@ -515,6 +538,7 @@ class RouteState:
     def limit_decision(self):
         with self.lock:
             self.decision_until = time.time() + DECISION_COOLDOWN
+        log("COOLDOWN decision model paused for %ds" % DECISION_COOLDOWN)
 
     def worker_result(self, ok):
         with self.lock:
@@ -613,7 +637,11 @@ def _strip_thinking(obj):
             m["content"] = kept or [{"type": "text", "text": "(no text)"}]
 
 
-def route_model(path, body):
+def log_swap(rid, old, new, reason):
+    log("#%s SWAP MODEL %s -> %s (%s)" % (rid, old, new, reason))
+
+
+def route_model(method, path, body, rid=0, user="-"):
     """Returns (body, model_used, fallback_chain). model_used is None if the request wasn't a model request."""
     if not body:
         return body, None, []
@@ -629,16 +657,21 @@ def route_model(path, body):
         decision = is_decision_request(obj)
         model, reason = pick_model(obj, decision)
         obj["model"] = model
+        stream = bool(obj.get("stream"))
         if STRIP_THINKING:
             _strip_thinking(obj)
         chain = build_chain(model, decision)
         msgs = obj.get("messages")
         last = msgs[-1] if isinstance(msgs, list) and msgs and isinstance(msgs[-1], dict) else {}
-        log("route: %r -> %s [%s] msgs=%d tools=%d last=%s%s fallback=%s" % (
-            orig, model, reason,
+        pv = preview(_block_text(last.get("content")))
+        log("#%d REQ %s %s user=%s model=%s reason=[%s] stream=%s msgs=%d tools=%d last=%s%s fallback=%s%s" % (
+            rid, method, clean, user, model, reason, stream,
             len(msgs) if isinstance(msgs, list) else 0,
             len(obj.get("tools") or []),
-            last.get("role"), _block_types(last.get("content")), chain))
+            last.get("role"), _block_types(last.get("content")),
+            chain or "none", (' text="%s"' % pv) if pv else ""))
+        if orig and str(orig).lower() != str(model).lower():
+            log_swap(rid, orig, model, reason)
         return json.dumps(obj).encode("utf-8"), model, chain
     return body, None, []
 
@@ -672,22 +705,39 @@ class KeyState:
             if self.keys and self.keys[0] == key:
                 self.fails = 0
 
-    def fail(self, key, status, immediate=False, reason=""):
+    def _rotate_locked(self, status, reason, rid):
+        old = self.keys.pop(0)
+        self.keys.append(old)
+        self.fails = 0
+        log("#%s SWAP KEY %s -> %s (HTTP %s%s, %d keys)" % (
+            rid if rid is not None else "-", mask(old), mask(self.keys[0]), status,
+            (": " + reason) if reason else "", len(self.keys)))
+
+    def rotate(self, status, reason="", rid=None):
+        """Force-rotate to the next key (no failure counting)."""
         with self.lock:
             if len(self.keys) < 2:
+                log("#%s SWAP KEY skipped: only %d key(s) configured" % (
+                    rid if rid is not None else "-", len(self.keys)))
+                return False
+            self._rotate_locked(status, reason, rid)
+            return True
+
+    def fail(self, key, status, immediate=False, reason="", rid=None):
+        r = rid if rid is not None else "-"
+        with self.lock:
+            if len(self.keys) < 2:
+                log("#%s KEY FAIL %s HTTP %d (single key, cannot rotate)" % (r, mask(key), status))
                 return False
             if self.keys[0] != key:
+                log("#%s KEY %s already swapped out by another request, retrying on %s" % (
+                    r, mask(key), mask(self.keys[0])))
                 return True
             self.fails += 1
             if immediate or status in IMMEDIATE or self.fails >= FAIL_LIMIT:
-                old = self.keys.pop(0)
-                self.keys.append(old)
-                self.fails = 0
-                msg = "key %s hit HTTP %d%s -> now using %s (%d keys)" % (
-                    mask(old), status, (" (" + reason + ")") if reason else "",
-                    mask(self.keys[0]), len(self.keys))
-                log("ROTATE " + msg)
+                self._rotate_locked(status, reason, rid)
                 return True
+            log("#%s KEY FAIL %s HTTP %d (%d/%d before swap)" % (r, mask(key), status, self.fails, FAIL_LIMIT))
             return False
 
 
@@ -718,6 +768,18 @@ def client_token(headers):
     if auth[:7].lower() == "bearer ":
         return auth[7:].strip()
     return (headers.get("x-api-key") or "").strip()
+
+
+def token_user(tok):
+    """Returns the proxy username owning this token, or None."""
+    if not tok:
+        return None
+    tb = tok.encode("utf-8", "replace")
+    found = None
+    for u, t in USERS.all().items():  # no early exit: constant-ish time over all tokens
+        if hmac.compare_digest(t.encode("utf-8", "replace"), tb):
+            found = u
+    return found
 
 
 def token_ok(tok):
@@ -922,26 +984,31 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(405, "Method not allowed")
 
         self.close_connection = True
+        rid = next_rid()
 
         # Fail closed: no users configured -> nobody gets in.
         if not USERS.all():
-            log("503 no proxy users configured; rejecting %s" % self.client_ip())
+            log("#%d 503 no proxy users configured; rejecting %s" % (rid, self.client_ip()))
             return self.send_json(503, "Proxy has no users configured")
-        if not token_ok(client_token(self.headers)):
-            log("401 unauthorized from %s" % self.client_ip())
+        user = token_user(client_token(self.headers))
+        if not user:
+            log("#%d 401 unauthorized %s %s from %s" % (rid, self.command, self.path, self.client_ip()))
             return self.send_json(401, "Unauthorized: invalid or missing token")
 
         if self.command == "GET" and path.endswith("/models"):
-            return self.handle_models()
+            return self.handle_models(rid, user)
 
         try:
             n = max(0, int(self.headers.get("Content-Length") or 0))
         except ValueError:
             n = 0
         if n > MAX_BODY:
+            log("#%d 413 body too large (%d bytes) user=%s" % (rid, n, user))
             return self.send_json(413, "Request body too large")
         body = self.rfile.read(n) if n else b""
-        body, model_used, chain = route_model(self.path, body)
+        body, model_used, chain = route_model(self.command, self.path, body, rid, user)
+        if model_used is None:
+            log("#%d REQ %s %s user=%s (no model field)" % (rid, self.command, self.path.split("?")[0], user))
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in SKIP_REQ}
         fwd["Accept-Encoding"] = "identity"
 
@@ -949,16 +1016,19 @@ class Handler(BaseHTTPRequestHandler):
         while True:
             key = STATE.current()
             if key is None:
-                log("503 no keys in env (API_KEY_*)")
+                log("#%d 503 no keys in env (API_KEY_*)" % rid)
                 return self.send_json(503, "No OpenRouter keys found in env (API_KEY_*)")
             fwd["Authorization"] = "Bearer " + key
             conn = None
+            ts = time.time()
+            log("#%d >> UPSTREAM model=%s key=%s attempt=%d" % (rid, model_used or "-", mask(key), attempts + 1))
             try:
                 conn = http.client.HTTPSConnection(UPSTREAM_HOST, timeout=300)
                 conn.request(self.command, UPSTREAM_PREFIX + self.path, body=body or None, headers=fwd)
                 resp = conn.getresponse()
             except Exception as e:
-                log("upstream error: %r" % (e,))
+                log("#%d !! UPSTREAM ERROR model=%s key=%s after %dms: %r" % (
+                    rid, model_used or "-", mask(key), int((time.time() - ts) * 1000), e))
                 if conn:
                     conn.close()
                 was_decision = is_decision(model_used)
@@ -970,31 +1040,28 @@ class Handler(BaseHTTPRequestHandler):
                     ROUTE.limit_decision()
                     if chain:
                         nxt = chain.pop(0)
-                        log("decision model %s unreachable -> falling back to %s" % (model_used, nxt))
+                        log_swap(rid, model_used, nxt, "decision model unreachable")
                         model_used = nxt
                         body = set_body_model(body, nxt)
                         continue
                 return self.send_json(502, "Upstream connection error: %r" % (e,))
 
             st = resp.status
+            ms = int((time.time() - ts) * 1000)
 
             # Smart model rate-limited: rotate key immediately and retry on smart.
             if st == 429 and is_smart(model_used):
                 resp.read()
                 conn.close()
                 ROUTE.smart_result(False)
-                log("smart model %s hit 429 -> rotating key, retrying smart" % (model_used,))
-                # Force key rotation (mimic fail behavior for rotation without counting fails)
-                with STATE.lock:
-                    if STATE.keys:
-                        old = STATE.keys.pop(0)
-                        STATE.keys.append(old)
-                        STATE.fails = 0
+                log("#%d << 429 model=%s key=%s %dms (smart model rate-limited)" % (rid, model_used, mask(key), ms))
+                STATE.rotate(429, "smart model rate-limited", rid)
                 if ROUTE.escalate():
+                    log_swap(rid, model_used, WORKER_MODEL, "smart model rate-limited repeatedly")
                     model_used = WORKER_MODEL
                     body = set_body_model(body, WORKER_MODEL)
-                    log('smart model rate-limited -> falling back to worker')
                 else:
+                    log("#%d RETRY smart model %s on new key" % (rid, SMART_MODEL))
                     model_used = SMART_MODEL  # retry same smart model with new key
                     body = set_body_model(body, SMART_MODEL)
                 continue
@@ -1005,8 +1072,8 @@ class Handler(BaseHTTPRequestHandler):
                 headers = resp.getheaders()
                 conn.close()
                 low = data.lower()
-                log("%s %s -> %d (key %s) body: %s" % (
-                    self.command, self.path, st, mask(key),
+                log("#%d << %d model=%s key=%s %dms body: %s" % (
+                    rid, st, model_used or "-", mask(key), ms,
                     data[:300].decode("utf-8", "replace").replace("\n", " ")))
                 daily = st == 429 and any(m in low for m in DAILY_MARKERS)
                 blocked = st == 403 and any(m in low for m in BLOCKED_MARKERS)
@@ -1018,28 +1085,43 @@ class Handler(BaseHTTPRequestHandler):
                         ROUTE.limit_decision()
                     if chain:
                         nxt = chain.pop(0)
-                        log("model %s unavailable (HTTP %d) -> falling back to %s" % (model_used, st, nxt))
+                        log_swap(rid, model_used, nxt, "model unavailable (HTTP %d%s)" % (
+                            st, ", blocked for non-agentic harness" if blocked else ""))
                         model_used = nxt
                         body = set_body_model(body, nxt)
                         continue
+                    log("#%d no fallback model left, returning HTTP %d to client" % (rid, st))
                     return self.send_buffered(st, headers, data)
                 if st not in KEY_STATUSES:
                     return self.send_buffered(st, headers, data)
-                if STATE.fail(key, st, immediate=daily, reason="daily quota" if daily else ""):
+                if STATE.fail(key, st, immediate=daily, reason="daily quota" if daily else "", rid=rid):
                     attempts += 1
                     if attempts >= STATE.count():
-                        log("503 all keys failed this request, will retry on next")
+                        log("#%d 503 all keys failed this request, will retry on next" % rid)
                         return self.send_json(503, "All OpenRouter keys exhausted (will retry)")
                     continue
                 return self.send_buffered(st, headers, data)
 
-            if st < 400:
-                STATE.ok(key)
+            if st >= 400:
+                data = resp.read()
+                headers = resp.getheaders()
+                conn.close()
+                if is_worker(model_used):
+                    ROUTE.worker_result(False)
+                if is_smart(model_used):
+                    ROUTE.smart_result(False)
+                log("#%d << %d model=%s key=%s %dms body: %s" % (
+                    rid, st, model_used or "-", mask(key), ms,
+                    data[:300].decode("utf-8", "replace").replace("\n", " ")))
+                return self.send_buffered(st, headers, data)
+
+            STATE.ok(key)
             if is_worker(model_used):
-                ROUTE.worker_result(st < 400)
+                ROUTE.worker_result(True)
             if is_smart(model_used):
-                ROUTE.smart_result(st < 400)
-            log("%s %s -> %d (key %s) model=%s" % (self.command, self.path, st, mask(key), model_used))
+                ROUTE.smart_result(True)
+            log("#%d << %d model=%s key=%s ttfb=%dms" % (rid, st, model_used or "-", mask(key), ms))
+            sent = 0
             try:
                 self.send_response(st)
                 for k, v in resp.getheaders():
@@ -1054,16 +1136,20 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     if not seen_tc and b"<tool_call>" in chunk:
                         seen_tc = True
-                        log("TEXT_TOOLCALL: %s returned a tool call as plain text" % (model_used,))
+                        log("#%d TEXT_TOOLCALL: %s returned a tool call as plain text" % (rid, model_used))
                     self.wfile.write(chunk)
                     self.wfile.flush()
+                    sent += len(chunk)
+                log("#%d DONE %d model=%s key=%s user=%s total=%dms bytes=%d" % (
+                    rid, st, model_used or "-", mask(key), user, int((time.time() - ts) * 1000), sent))
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                pass
+                log("#%d CLIENT DISCONNECTED model=%s after %dms bytes=%d" % (
+                    rid, model_used or "-", int((time.time() - ts) * 1000), sent))
             finally:
                 conn.close()
             return
 
-    def handle_models(self):
+    def handle_models(self, rid=0, user="-"):
         ids = []
         for m in (SMART_MODEL, WORKER_MODEL, DECISION_MODEL):
             if m and m.lower() not in [i.lower() for i in ids]:
@@ -1074,7 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
                       "display_name": m, "owned_by": "openrouter"} for m in ids],
             "has_more": False, "first_id": ids[0], "last_id": ids[-1],
         }).encode("utf-8")
-        log("GET %s -> 200 (local models list)" % self.path)
+        log("#%d GET %s -> 200 (local models list) user=%s" % (rid, self.path, user))
         self._send(200, body, "application/json")
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = handle_any
@@ -1101,9 +1187,9 @@ def main():
     except OSError as e:
         log("could not bind %s:%d: %r" % (HOST, PORT, e))
         return
-    log("keyproxy %s listening on http://%s:%d | %d keys | smart %s | worker %s | helper %s | decision %s (match=%s) | strip_thinking=%s" % (
+    log("keyproxy %s listening on http://%s:%d | %d keys | smart %s | worker %s | helper %s | decision %s (match=%s) | strip_thinking=%s | log_preview=%d" % (
         VERSION, HOST, PORT, len(API_KEYS), SMART_MODEL, WORKER_MODEL, HELPER_MODEL,
-        DECISION_MODEL or "disabled", DECISION_MATCH, STRIP_THINKING))
+        DECISION_MODEL or "disabled", DECISION_MATCH, STRIP_THINKING, LOG_PREVIEW))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
