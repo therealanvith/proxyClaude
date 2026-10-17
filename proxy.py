@@ -1,4 +1,4 @@
-"""KeyProxy v9-deploy: secure multi-key OpenRouter proxy."""
+"""KeyProxy v10-deploy: secure multi-key OpenRouter proxy."""
 import os, re, time, json, hmac, html, base64, secrets, logging, threading, http.client
 from logging.handlers import RotatingFileHandler
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +30,10 @@ def _csv(name):
     return {e.strip().lower() for e in os.environ.get(name, "").split(",") if e.strip()}
 
 
+def _csv_list(name, default=""):
+    return [e.strip().lower() for e in os.environ.get(name, default).split(",") if e.strip()]
+
+
 # --------------------------------------------------------------------- config
 API_KEYS = []
 _n = 1
@@ -59,12 +63,27 @@ COOKIE_SECURE = OAUTH_REDIRECT_URI.startswith("https://")
 SMART_MODEL = os.environ.get("SMART_MODEL", "apodex/apodex-1.1-mini:free")
 WORKER_MODEL = os.environ.get("WORKER_MODEL", "thinkingmachines/inkling:free")
 HELPER_MODEL = os.environ.get("HELPER_MODEL", WORKER_MODEL)
+
+# Decision model: handles Claude Code's classifier / auto-mode decision requests.
+# Empty = disabled. Fallback order when unavailable: decision -> smart -> worker.
+DECISION_MODEL = os.environ.get("DECISION_MODEL", "").strip()
+# A request is a decision request if the model name Claude Code asked for contains any of
+# these substrings (case-insensitive) ...
+DECISION_MATCH = _csv_list("DECISION_MATCH", "sonnet-4-6")
+# ... or if its system prompt / last message contains any of these (empty = off).
+DECISION_PROMPT_MATCH = _csv_list("DECISION_PROMPT_MATCH", "")
+DECISION_COOLDOWN = int(os.environ.get("DECISION_COOLDOWN", "60"))
+
+# Strip Claude Code's thinking params/blocks before forwarding (fixes free models that
+# print tool calls as plain text when reasoning mode is on).
+STRIP_THINKING = os.environ.get("STRIP_THINKING", "1") != "0"
+
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "5000"))
 DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-VERSION = "v9-deploy"
+VERSION = "v10-deploy"
 UPSTREAM_HOST = "openrouter.ai"
 UPSTREAM_PREFIX = "/api"
 
@@ -88,6 +107,7 @@ COUNTED = {403, 429}
 KEY_STATUSES = IMMEDIATE | COUNTED
 FAIL_LIMIT = 3
 DAILY_MARKERS = (b"free-models-per-day", b"per-day", b"per_day")
+BLOCKED_MARKERS = (b"agentic", b"only available on")
 SKIP_REQ = {"host", "authorization", "x-api-key", "content-length",
             "connection", "accept-encoding", "transfer-encoding", "keep-alive"}
 SKIP_RESP = {"transfer-encoding", "connection", "content-length", "keep-alive"}
@@ -438,6 +458,7 @@ def _msg_has_image(msgs):
 
 SMART_L = SMART_MODEL.lower()
 WORKER_L = WORKER_MODEL.lower()
+DECISION_L = DECISION_MODEL.lower()
 
 
 def is_smart(model):
@@ -448,14 +469,36 @@ def is_worker(model):
     return bool(model) and str(model).lower() == WORKER_L
 
 
+def is_decision(model):
+    return (bool(model) and bool(DECISION_L) and str(model).lower() == DECISION_L
+            and DECISION_L not in (SMART_L, WORKER_L))
+
+
+def is_decision_request(obj):
+    """True if this request is one of Claude Code's classifier/decision calls."""
+    if not DECISION_L:
+        return False
+    orig = str(obj.get("model") or "").lower()
+    if orig and any(m in orig for m in DECISION_MATCH):
+        return True
+    if DECISION_PROMPT_MATCH:
+        msgs = obj.get("messages") if isinstance(obj.get("messages"), list) else []
+        last = msgs[-1].get("content") if msgs and isinstance(msgs[-1], dict) else ""
+        hay = (_block_text(obj.get("system")) + "\n" + _block_text(last)).lower()
+        if any(m in hay for m in DECISION_PROMPT_MATCH):
+            return True
+    return False
+
+
 class RouteState:
-    """Shared routing state (locked). Smart-model cooldown is time-based; worker failures are real failures."""
+    """Shared routing state (locked). Smart/decision cooldowns are time-based; worker failures are real failures."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.worker_fails = 0
         self.smart_fails = 0
         self.smart_until = 0.0
+        self.decision_until = 0.0
 
     def smart_available(self):
         with self.lock:
@@ -464,6 +507,14 @@ class RouteState:
     def limit_smart(self):
         with self.lock:
             self.smart_until = time.time() + SMART_COOLDOWN
+
+    def decision_available(self):
+        with self.lock:
+            return time.time() >= self.decision_until
+
+    def limit_decision(self):
+        with self.lock:
+            self.decision_until = time.time() + DECISION_COOLDOWN
 
     def worker_result(self, ok):
         with self.lock:
@@ -484,7 +535,15 @@ class RouteState:
 ROUTE = RouteState()
 
 
-def pick_model(obj):
+def pick_model(obj, decision=False):
+    # Decision (classifier) requests: decision model -> smart -> worker.
+    if decision:
+        if ROUTE.decision_available():
+            return DECISION_MODEL, "decision request"
+        if ROUTE.smart_available():
+            return SMART_MODEL, "decision request, decision cooling down -> smart"
+        return WORKER_MODEL, "decision request, decision+smart cooling down -> worker"
+
     msgs = obj.get("messages") if isinstance(obj.get("messages"), list) else []
     has_tools = bool(obj.get("tools"))
     if "haiku" in str(obj.get("model") or "").lower():
@@ -522,30 +581,66 @@ def pick_model(obj):
     return SMART_MODEL, reason
 
 
+def build_chain(model, decision):
+    """Fallback models to try, in order, if `model` is unavailable."""
+    if decision:
+        order = []
+        for m in (DECISION_MODEL, SMART_MODEL, WORKER_MODEL):
+            if m and m.lower() not in [o.lower() for o in order]:
+                order.append(m)
+        try:
+            idx = [o.lower() for o in order].index(str(model).lower())
+        except ValueError:
+            return []
+        return order[idx + 1:]
+    if is_smart(model):
+        return [WORKER_MODEL] if WORKER_L != str(model).lower() else []
+    alt = SMART_MODEL
+    return [alt] if alt.lower() != str(model).lower() else []
+
+
+def _strip_thinking(obj):
+    """Drop Claude Code's thinking param and thinking blocks in history."""
+    obj.pop("thinking", None)
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list):
+        return
+    for m in msgs:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list):
+            kept = [b for b in c if not (isinstance(b, dict)
+                    and b.get("type") in ("thinking", "redacted_thinking"))]
+            m["content"] = kept or [{"type": "text", "text": "(no text)"}]
+
+
 def route_model(path, body):
-    """Returns (body, model_used). model_used is None if the request wasn't a model request."""
+    """Returns (body, model_used, fallback_chain). model_used is None if the request wasn't a model request."""
     if not body:
-        return body, None
+        return body, None, []
     try:
         obj = json.loads(body)
     except Exception:
-        return body, None
+        return body, None, []
     if not isinstance(obj, dict):
-        return body, None
+        return body, None, []
     clean = path.split("?")[0].rstrip("/")
     if "model" in obj or clean.endswith(("/messages", "/chat/completions", "/completions")):
         orig = obj.get("model")
-        model, reason = pick_model(obj)
+        decision = is_decision_request(obj)
+        model, reason = pick_model(obj, decision)
         obj["model"] = model
+        if STRIP_THINKING:
+            _strip_thinking(obj)
+        chain = build_chain(model, decision)
         msgs = obj.get("messages")
         last = msgs[-1] if isinstance(msgs, list) and msgs and isinstance(msgs[-1], dict) else {}
-        log("route: %r -> %s [%s] msgs=%d tools=%d last=%s%s" % (
+        log("route: %r -> %s [%s] msgs=%d tools=%d last=%s%s fallback=%s" % (
             orig, model, reason,
             len(msgs) if isinstance(msgs, list) else 0,
             len(obj.get("tools") or []),
-            last.get("role"), _block_types(last.get("content"))))
-        return json.dumps(obj).encode("utf-8"), model
-    return body, None
+            last.get("role"), _block_types(last.get("content")), chain))
+        return json.dumps(obj).encode("utf-8"), model, chain
+    return body, None, []
 
 
 def set_body_model(body, model):
@@ -846,7 +941,7 @@ class Handler(BaseHTTPRequestHandler):
         if n > MAX_BODY:
             return self.send_json(413, "Request body too large")
         body = self.rfile.read(n) if n else b""
-        body, model_used = route_model(self.path, body)
+        body, model_used, chain = route_model(self.path, body)
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in SKIP_REQ}
         fwd["Accept-Encoding"] = "identity"
 
@@ -866,10 +961,19 @@ class Handler(BaseHTTPRequestHandler):
                 log("upstream error: %r" % (e,))
                 if conn:
                     conn.close()
+                was_decision = is_decision(model_used)
                 if is_worker(model_used):
                     ROUTE.worker_result(False)
                 if is_smart(model_used):
                     ROUTE.smart_result(False)
+                if was_decision:
+                    ROUTE.limit_decision()
+                    if chain:
+                        nxt = chain.pop(0)
+                        log("decision model %s unreachable -> falling back to %s" % (model_used, nxt))
+                        model_used = nxt
+                        body = set_body_model(body, nxt)
+                        continue
                 return self.send_json(502, "Upstream connection error: %r" % (e,))
 
             st = resp.status
@@ -895,15 +999,32 @@ class Handler(BaseHTTPRequestHandler):
                     body = set_body_model(body, SMART_MODEL)
                 continue
 
-            if st in KEY_STATUSES:
+            dec_soft_fail = is_decision(model_used) and chain and (st == 404 or st >= 500)
+            if st in KEY_STATUSES or dec_soft_fail:
                 data = resp.read()
                 headers = resp.getheaders()
                 conn.close()
                 low = data.lower()
-                daily = st == 429 and any(m in low for m in DAILY_MARKERS)
                 log("%s %s -> %d (key %s) body: %s" % (
                     self.command, self.path, st, mask(key),
                     data[:300].decode("utf-8", "replace").replace("\n", " ")))
+                daily = st == 429 and any(m in low for m in DAILY_MARKERS)
+                blocked = st == 403 and any(m in low for m in BLOCKED_MARKERS)
+                decision_down = is_decision(model_used) and (
+                    dec_soft_fail or blocked or (st == 429 and not daily))
+                if blocked or decision_down:
+                    # Model-level failure (not a bad key): switch model, don't rotate keys.
+                    if is_decision(model_used):
+                        ROUTE.limit_decision()
+                    if chain:
+                        nxt = chain.pop(0)
+                        log("model %s unavailable (HTTP %d) -> falling back to %s" % (model_used, st, nxt))
+                        model_used = nxt
+                        body = set_body_model(body, nxt)
+                        continue
+                    return self.send_buffered(st, headers, data)
+                if st not in KEY_STATUSES:
+                    return self.send_buffered(st, headers, data)
                 if STATE.fail(key, st, immediate=daily, reason="daily quota" if daily else ""):
                     attempts += 1
                     if attempts >= STATE.count():
@@ -918,7 +1039,7 @@ class Handler(BaseHTTPRequestHandler):
                 ROUTE.worker_result(st < 400)
             if is_smart(model_used):
                 ROUTE.smart_result(st < 400)
-            log("%s %s -> %d (key %s)" % (self.command, self.path, st, mask(key)))
+            log("%s %s -> %d (key %s) model=%s" % (self.command, self.path, st, mask(key), model_used))
             try:
                 self.send_response(st)
                 for k, v in resp.getheaders():
@@ -926,10 +1047,14 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_header(k, v)
                 self.send_header("Connection", "close")
                 self.end_headers()
+                seen_tc = False
                 while True:
                     chunk = resp.read1(65536)
                     if not chunk:
                         break
+                    if not seen_tc and b"<tool_call>" in chunk:
+                        seen_tc = True
+                        log("TEXT_TOOLCALL: %s returned a tool call as plain text" % (model_used,))
                     self.wfile.write(chunk)
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
@@ -939,7 +1064,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     def handle_models(self):
-        ids = [SMART_MODEL] if SMART_MODEL == WORKER_MODEL else [SMART_MODEL, WORKER_MODEL]
+        ids = []
+        for m in (SMART_MODEL, WORKER_MODEL, DECISION_MODEL):
+            if m and m.lower() not in [i.lower() for i in ids]:
+                ids.append(m)
         body = json.dumps({
             "object": "list",
             "data": [{"id": m, "object": "model", "type": "model",
@@ -973,8 +1101,9 @@ def main():
     except OSError as e:
         log("could not bind %s:%d: %r" % (HOST, PORT, e))
         return
-    log("keyproxy %s listening on http://%s:%d | %d keys | smart %s | worker %s | helper %s" % (
-        VERSION, HOST, PORT, len(API_KEYS), SMART_MODEL, WORKER_MODEL, HELPER_MODEL))
+    log("keyproxy %s listening on http://%s:%d | %d keys | smart %s | worker %s | helper %s | decision %s (match=%s) | strip_thinking=%s" % (
+        VERSION, HOST, PORT, len(API_KEYS), SMART_MODEL, WORKER_MODEL, HELPER_MODEL,
+        DECISION_MODEL or "disabled", DECISION_MATCH, STRIP_THINKING))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
